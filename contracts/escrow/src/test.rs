@@ -7,7 +7,9 @@ struct Setup<'a> {
     env: Env,
     admin: Address,
     escrow: EscrowClient<'a>,
+    escrow_address: Address,
     token: TokenClient<'a>,
+    asset: StellarAssetClient<'a>,
     client: Address,
     freelancer: Address,
 }
@@ -19,7 +21,8 @@ fn setup<'a>() -> Setup<'a> {
     let client = Address::generate(&env);
     let freelancer = Address::generate(&env);
     let sac = env.register_stellar_asset_contract_v2(admin.clone());
-    StellarAssetClient::new(&env, &sac.address()).mint(&client, &1_000);
+    let asset = StellarAssetClient::new(&env, &sac.address());
+    asset.mint(&client, &1_000);
     let id = env.register(Escrow, ());
     let escrow = EscrowClient::new(&env, &id);
     escrow.initialize(&admin);
@@ -28,7 +31,9 @@ fn setup<'a>() -> Setup<'a> {
         env,
         admin,
         escrow,
+        escrow_address: id,
         token,
+        asset,
         client,
         freelancer,
     }
@@ -88,6 +93,7 @@ fn rejects_overfunding_and_double_release() {
 #[test]
 fn dispute_split_and_cancel() {
     let s = setup();
+    s.asset.mint(&s.freelancer, &1_000);
     let id = s.escrow.create_contract(
         &s.client,
         &s.freelancer,
@@ -96,8 +102,9 @@ fn dispute_split_and_cancel() {
     );
     s.escrow.deposit_funds(&id, &400);
     s.escrow.open_dispute(&id, &s.freelancer);
-    s.escrow.resolve_dispute(&id, &2_500);
-    assert_eq!(s.token.balance(&s.freelancer), 100);
+    // Bond is 2% of 400 = 8; returned to the freelancer, so it nets out.
+    s.escrow.resolve_dispute(&id, &2_500, &true);
+    assert_eq!(s.token.balance(&s.freelancer), 1_100);
     assert_eq!(s.token.balance(&s.client), 900);
 
     let id2 = s.escrow.create_contract(
@@ -133,6 +140,7 @@ fn pause_blocks_mutations() {
 #[test]
 fn dispute_outcomes_freelancer_client_and_exact_threshold() {
     let s = setup();
+    s.asset.mint(&s.freelancer, &1_000);
 
     // 1. Freelancer-favoured resolution (> 5_000 bps): 7_500 bps
     let id1 = s.escrow.create_contract(
@@ -143,7 +151,7 @@ fn dispute_outcomes_freelancer_client_and_exact_threshold() {
     );
     s.escrow.deposit_funds(&id1, &200);
     s.escrow.open_dispute(&id1, &s.client);
-    s.escrow.resolve_dispute(&id1, &7_500);
+    s.escrow.resolve_dispute(&id1, &7_500, &true);
 
     let client_outcomes1 = s.escrow.get_outcomes(&s.client);
     let freelancer_outcomes1 = s.escrow.get_outcomes(&s.freelancer);
@@ -163,7 +171,7 @@ fn dispute_outcomes_freelancer_client_and_exact_threshold() {
     );
     s.escrow.deposit_funds(&id2, &200);
     s.escrow.open_dispute(&id2, &s.freelancer);
-    s.escrow.resolve_dispute(&id2, &2_000);
+    s.escrow.resolve_dispute(&id2, &2_000, &true);
 
     let client_outcomes2 = s.escrow.get_outcomes(&s.client);
     let freelancer_outcomes2 = s.escrow.get_outcomes(&s.freelancer);
@@ -183,7 +191,7 @@ fn dispute_outcomes_freelancer_client_and_exact_threshold() {
     );
     s.escrow.deposit_funds(&id3, &200);
     s.escrow.open_dispute(&id3, &s.client);
-    s.escrow.resolve_dispute(&id3, &5_000);
+    s.escrow.resolve_dispute(&id3, &5_000, &true);
 
     let client_outcomes3 = s.escrow.get_outcomes(&s.client);
     let freelancer_outcomes3 = s.escrow.get_outcomes(&s.freelancer);
@@ -208,7 +216,7 @@ fn rate_resolved_escrow_succeeds_once_and_cancelled_rejected() {
     );
     s.escrow.deposit_funds(&id, &100);
     s.escrow.open_dispute(&id, &s.client);
-    s.escrow.resolve_dispute(&id, &5_000);
+    s.escrow.resolve_dispute(&id, &5_000, &true);
 
     assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Resolved);
 
@@ -621,6 +629,11 @@ fn randomized_lifecycle_property_test() {
             } else {
                 c2.funded_amount - c2.released_amount
             };
+            let snap_target_bond = s
+                .escrow
+                .get_dispute_bond(&target_id)
+                .map(|(_, b)| b)
+                .unwrap_or(0);
 
             let op_res = match op {
                 0 => {
@@ -641,7 +654,8 @@ fn randomized_lifecycle_property_test() {
                 }
                 3 => {
                     let bps = rng.next_bounded(12_000);
-                    s.escrow.try_resolve_dispute(&target_id, &bps)
+                    let to_opener = bps % 2 == 0;
+                    s.escrow.try_resolve_dispute(&target_id, &bps, &to_opener)
                 }
                 4 => s.escrow.try_cancel_contract(&target_id),
                 5 => {
@@ -657,9 +671,15 @@ fn randomized_lifecycle_property_test() {
                 let new_bal = s.token.balance(&s.escrow.address);
                 let new_held = new_c.funded_amount - new_c.released_amount;
                 let delta_held = new_held - snap_target_held;
+                let new_bond = s
+                    .escrow
+                    .get_dispute_bond(&target_id)
+                    .map(|(_, b)| b)
+                    .unwrap_or(0);
+                let delta_bond = new_bond - snap_target_bond;
                 assert_eq!(
                     new_bal,
-                    bal_contract + delta_held,
+                    bal_contract + delta_held + delta_bond,
                     "Contract token balance mismatch in iteration {} (seed: {:#x})",
                     iteration,
                     SEED
@@ -690,4 +710,91 @@ fn randomized_lifecycle_property_test() {
             }
         }
     }
+}
+
+#[test]
+fn open_dispute_without_bond_tokens_keeps_escrow_funded() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 1_000i128],
+    );
+    s.escrow.deposit_funds(&id, &1_000);
+    // The client spent everything, so it cannot pay the bond (2% of 1_000 = 20).
+    assert_eq!(s.token.balance(&s.client), 0);
+    assert!(s.escrow.try_open_dispute(&id, &s.client).is_err());
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+    assert_eq!(s.escrow.get_dispute_bond(&id), None);
+}
+
+#[test]
+fn dispute_bond_returns_to_opener() {
+    let s = setup();
+    s.asset.mint(&s.freelancer, &1_000);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 400i128],
+    );
+    s.escrow.deposit_funds(&id, &400);
+    s.escrow.open_dispute(&id, &s.freelancer);
+    assert_eq!(
+        s.escrow.get_dispute_bond(&id),
+        Some((s.freelancer.clone(), 8))
+    );
+
+    s.escrow.resolve_dispute(&id, &2_500, &true);
+
+    // Split is 100/300, unaffected by the bond; the 8 bond returns to the opener.
+    assert_eq!(s.token.balance(&s.freelancer), 1_000 - 8 + 100 + 8);
+    assert_eq!(s.token.balance(&s.client), 1_000 - 400 + 300);
+    assert_eq!(s.token.balance(&s.escrow_address), 0);
+}
+
+#[test]
+fn dispute_bond_forfeited_to_counterparty() {
+    let s = setup();
+    s.asset.mint(&s.freelancer, &1_000);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 400i128],
+    );
+    s.escrow.deposit_funds(&id, &400);
+    s.escrow.open_dispute(&id, &s.freelancer);
+
+    s.escrow.resolve_dispute(&id, &2_500, &false);
+
+    // Same split, but the 8 bond is forfeited to the client (the counterparty).
+    assert_eq!(s.token.balance(&s.freelancer), 1_000 - 8 + 100);
+    assert_eq!(s.token.balance(&s.client), 1_000 - 400 + 300 + 8);
+    assert_eq!(s.token.balance(&s.escrow_address), 0);
+}
+
+#[test]
+fn dispute_bond_rounds_to_zero_for_tiny_total() {
+    let s = setup();
+    s.asset.mint(&s.freelancer, &1_000);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 40i128],
+    );
+    s.escrow.deposit_funds(&id, &40);
+    s.escrow.open_dispute(&id, &s.freelancer);
+    // 40 * 200 / 10_000 == 0.
+    assert_eq!(
+        s.escrow.get_dispute_bond(&id),
+        Some((s.freelancer.clone(), 0))
+    );
+
+    s.escrow.resolve_dispute(&id, &5_000, &true);
+    assert_eq!(s.token.balance(&s.freelancer), 1_000 + 20);
+    assert_eq!(s.token.balance(&s.client), 1_000 - 40 + 20);
+    assert_eq!(s.token.balance(&s.escrow_address), 0);
 }
