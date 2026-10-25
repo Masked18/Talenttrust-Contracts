@@ -4901,7 +4901,8 @@ fn dispute_resolved_cancel_and_rep_events() {
             bond: dispute_bond(400 * U),
         }
     );
-    resolve_refunding_bond(&s, &id, &2_500);
+    // Events are per invocation: read them right after the call.
+    s.escrow.resolve_dispute(&s.admin, &id, &2_500, &true);
     let r: ResolvedEvent = last_escrow_event(&s, "resolved", id).unwrap();
     assert_eq!(
         r,
@@ -5008,14 +5009,14 @@ fn dispute_bond_forfeited_to_counterparty() {
     s.escrow.open_dispute(&id, &s.freelancer);
 
     s.escrow.resolve_dispute(&s.admin, &id, &2_500, &false);
+    let r: ResolvedEvent = last_escrow_event(&s, "resolved", id).unwrap();
+    assert_eq!(r.bond_recipient, Some(s.client.clone()));
+    assert_eq!(r.bond, 8 * U);
 
     // Same split, but the 8 bond is forfeited to the client (the counterparty).
     assert_eq!(s.token.balance(&s.freelancer), 1_000 * U - 8 * U + 100 * U);
     assert_eq!(s.token.balance(&s.client), 1_000 * U - 400 * U + 300 * U + 8 * U);
     assert_eq!(s.token.balance(&s.escrow.address), 0);
-    let r: ResolvedEvent = last_escrow_event(&s, "resolved", id).unwrap();
-    assert_eq!(r.bond_recipient, Some(s.client.clone()));
-    assert_eq!(r.bond, 8 * U);
 }
 
 #[test]
